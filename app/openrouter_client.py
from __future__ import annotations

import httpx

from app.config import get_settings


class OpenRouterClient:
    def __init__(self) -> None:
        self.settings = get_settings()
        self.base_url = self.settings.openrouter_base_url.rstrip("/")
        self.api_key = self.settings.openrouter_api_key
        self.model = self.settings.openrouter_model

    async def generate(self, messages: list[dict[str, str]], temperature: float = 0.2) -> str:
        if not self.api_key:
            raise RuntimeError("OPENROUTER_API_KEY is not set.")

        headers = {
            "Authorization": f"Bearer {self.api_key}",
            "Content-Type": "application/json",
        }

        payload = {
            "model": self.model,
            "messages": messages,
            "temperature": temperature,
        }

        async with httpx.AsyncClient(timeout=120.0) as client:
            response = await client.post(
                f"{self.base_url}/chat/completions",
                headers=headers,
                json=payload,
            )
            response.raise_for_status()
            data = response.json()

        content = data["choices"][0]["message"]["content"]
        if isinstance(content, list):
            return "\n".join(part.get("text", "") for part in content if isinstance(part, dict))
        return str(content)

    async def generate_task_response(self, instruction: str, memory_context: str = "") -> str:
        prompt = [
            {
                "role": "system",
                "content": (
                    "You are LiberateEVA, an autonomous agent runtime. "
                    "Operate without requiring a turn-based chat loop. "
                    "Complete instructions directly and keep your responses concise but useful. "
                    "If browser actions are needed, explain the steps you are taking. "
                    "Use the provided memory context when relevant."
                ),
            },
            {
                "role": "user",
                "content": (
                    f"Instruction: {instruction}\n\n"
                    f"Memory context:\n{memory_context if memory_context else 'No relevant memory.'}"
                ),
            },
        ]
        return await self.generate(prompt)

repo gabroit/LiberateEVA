@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import chromadb
+
+from app.config import get_settings
+
+
+class PersistentMemory:
+    def __init__(self, collection_name: str = "agent_memory") -> None:
+        self.settings = get_settings()
+        self.persist_dir = Path(self.settings.vector_db_path)
+        self.persist_dir.mkdir(parents=True, exist_ok=True)
+
+        self.client = chromadb.PersistentClient(path=str(self.persist_dir))
+        self.collection = self.client.get_or_create_collection(name=collection_name)
+
+    def add(self, content: str, metadata: dict[str, Any] | None = None) -> str:
+        metadata = metadata or {}
+        doc_id = f"mem_{abs(hash(content + json.dumps(metadata, sort_keys=True)))}"
+        self.collection.add(
+            documents=[content],
+            metadatas=[metadata],
+            ids=[doc_id],
+        )
+        return doc_id
+
+    def query(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        if not query or not query.strip():
+            return []
+
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=limit,
+        )
+
+        docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        outputs: list[dict[str, Any]] = []
+        for idx, doc in enumerate(docs):
+            outputs.append(
+                {
+                    "content": doc,
+                    "metadata": metas[idx] if idx < len(metas) else {},
+                    "distance": distances[idx] if idx < len(distances) else None,
+                }
+            )
+        return outputs
+
+    def list_recent(self, limit: int = 10) -> list[dict[str, Any]]:
+        result = self.collection.get(limit=limit)
+        docs = result.get("documents", [])
+        metas = result.get("metadatas", [])
+        ids = result.get("ids", [])
+
+        out: list[dict[str, Any]] = []
+        for idx, doc in enumerate(docs):
+            out.append({"id": ids[idx], "content": doc, "metadata": metas[idx] if idx < len(metas) else {}})
+        return out

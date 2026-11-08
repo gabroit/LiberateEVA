@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Local data
+.data/
+data/
+.env
+
+# Playwright
+playwright/.cache/
+
+# Editor
+.vscode/
