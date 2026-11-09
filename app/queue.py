@@ -1,80 +1,113 @@
 from __future__ import annotations
 
-import asyncio
 import json
+import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from playwright.async_api import async_playwright
 
-from app.config import get_settings
+class SQLiteTaskQueue:
+    def __init__(self, db_path: str | None = None) -> None:
+        self.db_path = db_path or "./data/runtime.db"
+        self._ensure_parent()
+        self.init_db()
+
+    def _ensure_parent(self) -> None:
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    task_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    run_after TEXT NOT NULL,
+                    last_error TEXT
+                )
+                """
+            )
+            conn.commit()
+
+    def enqueue(self, task_type: str, payload: dict[str, Any], task_id: str | None = None) -> str:
+        task_id = task_id or f"task_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO tasks (id, task_type, payload, status, created_at, updated_at, run_after)
+                VALUES (?, ?, ?, 'queued', ?, ?, ?)
+                """,
+                (task_id, task_type, json.dumps(payload), now, now, now),
+            )
+            conn.commit()
+        return task_id
+
+    def claim_next(self) -> dict[str, Any] | None:
+        now = _now_iso()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status = 'queued' AND run_after <= ?
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+
+            if row is None:
+                return None
+
+            conn.execute(
+                "UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ?",
+                (_now_iso(), row["id"]),
+            )
+            conn.commit()
+            return {**dict(row), "payload": json.loads(row["payload"])}
+
+    def mark_complete(self, task_id: str, result: dict[str, Any] | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'completed', updated_at = ?, payload = ?, last_error = NULL
+                WHERE id = ?
+                """,
+                (_now_iso(), json.dumps(result or {}), task_id),
+            )
+            conn.commit()
+
+    def mark_failed(self, task_id: str, error: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'failed', updated_at = ?, last_error = ?
+                WHERE id = ?
+                """,
+                (_now_iso(), error, task_id),
+            )
+            conn.commit()
+
+    def list_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
 
 
-class BrowserTool:
-    def __init__(self) -> None:
-        self.settings = get_settings()
-        self.browser = None
-        self.context = None
-        self.page = None
-        self._lock = asyncio.Lock()
-
-    async def ensure_started(self) -> None:
-        if self.page is not None and not self.page.is_closed():
-            return
-
-        playwright = await async_playwright().start()
-        self.browser = await playwright.chromium.launch(headless=self.settings.browser_headless)
-        self.context = await self.browser.new_context(viewport={"width": 1440, "height": 1100})
-        self.page = await self.context.new_page()
-
-    async def navigate(self, url: str) -> str:
-        await self.ensure_started()
-        response = await self.page.goto(url, wait_until="networkidle", timeout=self.settings.browser_timeout)
-        return response.status if response else "unknown"
-
-    async def fill(self, selector: str, value: str) -> None:
-        await self.ensure_started()
-        await self.page.fill(selector, value)
-
-    async def click(self, selector: str) -> None:
-        await self.ensure_started()
-        await self.page.click(selector, timeout=self.settings.browser_timeout)
-
-    async def text(self, selector: str | None = None) -> str:
-        await self.ensure_started()
-        if selector:
-            return await self.page.locator(selector).inner_text()
-        return await self.page.inner_text("body")
-
-    async def screenshot(self, path: str) -> str:
-        await self.ensure_started()
-        output = Path(path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        await self.page.screenshot(path=str(output), full_page=True)
-        return str(output)
-
-    async def close(self) -> None:
-        if self.context:
-            await self.context.close()
-        if self.browser:
-            await self.browser.close()
-        self.page = None
-        self.context = None
-        self.browser = None
-
-    async def execute(self, action: dict[str, Any]) -> str:
-        kind = action.get("type", "navigate")
-        if kind == "navigate":
-            return await self.navigate(str(action.get("url", "https://example.com")))
-        if kind == "fill":
-            await self.fill(str(action.get("selector", "input")), str(action.get("value", "")))
-            return "filled"
-        if kind == "click":
-            await self.click(str(action.get("selector", "button")))
-            return "clicked"
-        if kind == "text":
-            return await self.text(str(action.get("selector")) if action.get("selector") else None)
-        if kind == "screenshot":
-            return await self.screenshot(str(action.get("path", "./data/screenshot.png")))
-        raise ValueError(f"Unsupported browser action: {kind}")
-
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
