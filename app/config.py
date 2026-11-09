@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,11 +17,14 @@ class Settings(BaseSettings):
 
     vector_db_path: str = "./data/chroma"
     sqlite_path: str = "./data/runtime.db"
+    instance_registry_path: str = "./data/instance_registry.db"
+    state_export_path: str = "./data/state"
 
     browser_headless: bool = True
     browser_timeout: int = 30000
 
     log_level: str = "INFO"
+    agent_context_path: str = "agent_context.txt"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
