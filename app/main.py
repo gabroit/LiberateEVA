@@ -1,92 +1,74 @@
 from __future__ import annotations
 
-import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
-from app.browser_tool import BrowserTool
-from app.memory import PersistentMemory
-from app.openrouter_client import OpenRouterClient
-from app.queue import SharedStateQueue
+from fastapi import FastAPI, HTTPException, Request
+
+from app.admin import router as admin_router
+from app.agent_runtime import AgentRuntime
+from app.config import get_settings
+from app.queue import SQLiteTaskQueue
+from app.registry import InstanceRegistry, require_webhook_secret, router as registry_router
+
+settings = get_settings()
+queue = SQLiteTaskQueue(settings.sqlite_path)
+runtime = AgentRuntime(queue)
+app = FastAPI(title="LiberateEVA")
+
+app.include_router(admin_router)
+app.include_router(registry_router)
 
 
-class AgentRuntime:
-    def __init__(self, queue: SharedStateQueue, memory: PersistentMemory, browser: BrowserTool, llm: OpenRouterClient) -> None:
-        self.queue = queue
-        self.memory = memory
-        self.browser = browser
-        self.llm = llm
-        self.running = False
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    return {"status": "ok", "app_name": settings.app_name, "autonomous_self_replication": False}
 
-    async def ingest_instruction(self, instruction: str, metadata: dict[str, Any] | None = None) -> str:
-        payload = {"instruction": instruction, "metadata": metadata or {}}
-        return self.queue.enqueue("instruction", payload)
 
-    async def process_task(self, task: dict[str, Any]) -> dict[str, Any]:
-        instruction = str(task.get("payload", {}).get("instruction", ""))
-        metadata = task.get("payload", {}).get("metadata", {})
+@app.post("/webhook")
+async def webhook(request: Request) -> dict[str, Any]:
+    require_webhook_secret(request)
+    payload = await request.json()
+    instruction = payload.get("instruction") or payload.get("text")
+    if not instruction:
+        raise HTTPException(status_code=400, detail="instruction is required")
+    task_id = await runtime.ingest_instruction(str(instruction), {"source": "webhook"})
+    return {"status": "accepted", "task_id": task_id}
 
-        if not instruction:
-            raise ValueError("No instruction provided for task")
 
-        memory_context = self.memory.query(instruction, limit=3)
-        memory_summary = "\n".join(item["content"] for item in memory_context)
+@app.get("/state/export")
+async def state_export(request: Request) -> dict[str, Any]:
+    require_webhook_secret(request)
+    snapshot = {
+        "runtime_db": settings.sqlite_path,
+        "tasks": queue.list_tasks(limit=200),
+        "exported_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+    }
+    return snapshot
 
-        llm_response = await self.llm.generate_task_response(instruction, memory_summary)
 
-        browser_action = None
-        if "browser" in instruction.lower() or "navigate" in instruction.lower() or "visit" in instruction.lower():
-            url_match = self._extract_url(instruction)
-            if url_match:
-                browser_action = {"type": "navigate", "url": url_match}
-                await self.browser.execute(browser_action)
-                page_text = await self.browser.text()
-                llm_response = await self.llm.generate(
-                    [
-                        {"role": "system", "content": "You are an agent performing browser-based tasks."},
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Instruction: {instruction}\n\n"
-                                f"The page content is:\n{page_text[:4000]}\n\n"
-                                "Use the page text to answer the user fully and accurately."
-                            ),
-                        },
-                    ]
-                )
+@app.post("/state/import")
+async def state_import(request: Request) -> dict[str, Any]:
+    require_webhook_secret(request)
+    payload = await request.json()
+    if not payload.get("tasks"):
+        raise HTTPException(status_code=400, detail="tasks payload required for import")
+    for task in payload["tasks"]:
+        queue.enqueue(task.get("task_type", "instruction"), task.get("payload", {}), task_id=task.get("id"))
+    return {"status": "imported", "count": len(payload["tasks"]), "autonomous_self_replication": False}
 
-        self.memory.add(instruction, {"source": metadata.get("source", "runtime"), "task_id": task["id"]})
-        self.memory.add(llm_response, {"source": "agent_response", "task_id": task["id"]})
 
-        return {
-            "task_id": task["id"],
-            "instruction": instruction,
-            "response": llm_response,
-            "browser_action": browser_action,
-        }
+@app.get("/admin/instances")
+async def list_instances(request: Request) -> dict[str, Any]:
+    require_webhook_secret(request)
+    registry = InstanceRegistry()
+    return {"instances": registry.list_instances()}
 
-    async def worker_loop(self, interval: float = 2.0) -> None:
-        self.running = True
-        while self.running:
-            task = self.queue.claim_next()
-            if not task:
-                await asyncio.sleep(interval)
-                continue
 
-            try:
-                result = await self.process_task(task)
-                self.queue.mark_complete(task["id"], result)
-            except Exception as exc:  # pragma: no cover - runtime safety
-                self.queue.mark_failed(task["id"], str(exc))
-            finally:
-                await asyncio.sleep(0.1)
-
-    def stop(self) -> None:
-        self.running = False
-
-    @staticmethod
-    def _extract_url(text: str) -> str | None:
-        import re
-
-        match = re.search(r"https?://[^\s\)\]>]+", text)
-        return match.group(0) if match else None
+@app.on_event("startup")
+async def startup_event() -> None:
+    runtime.running = True
+    # this intentionally does not self-deploy or self-replicate
+    # each instance is now operator-controlled
+    pass
